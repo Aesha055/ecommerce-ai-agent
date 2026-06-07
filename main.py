@@ -1,18 +1,20 @@
 import os
 import asyncio
+import threading
 import uvicorn
+from fastmcp import FastMCP
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google.adk.agents import Agent
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import SseConnectionParams
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-# ── ENV ────────────────────────────────────────────────────────────────────
 os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY", "")
 
-# ── FASTAPI APP ────────────────────────────────────────────────────────────
 app = FastAPI(title="E-Commerce AI Agent")
 
 app.add_middleware(
@@ -22,7 +24,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── DATA ───────────────────────────────────────────────────────────────────
 products = {
     "P001": {"name": "Nike Air Max",       "price": 4999,  "stock": 15, "category": "Shoes"},
     "P002": {"name": "Samsung 55 TV",      "price": 49999, "stock": 3,  "category": "Electronics"},
@@ -36,18 +37,22 @@ orders = {
     "ORD003": {"item": "Laptop Bag",  "status": "Processing", "eta": "3 days"},
 }
 
-# ── TOOLS ──────────────────────────────────────────────────────────────────
+mcp = FastMCP("ecommerce-product-catalog")
+
+@mcp.tool()
 def search_products(query: str) -> dict:
     """Search for products by name or category."""
     results = [{"id": pid, **p} for pid, p in products.items()
                if query.lower() in p["name"].lower() or query.lower() in p["category"].lower()]
     return {"results": results if results else "No products found."}
 
+@mcp.tool()
 def get_product_details(product_id: str) -> dict:
     """Get full details of a product by its ID."""
     p = products.get(product_id.upper())
     return {"product_id": product_id, **p} if p else {"error": f"Product {product_id} not found."}
 
+@mcp.tool()
 def check_stock(product_id: str) -> dict:
     """Check if a product is in stock."""
     p = products.get(product_id.upper())
@@ -55,11 +60,13 @@ def check_stock(product_id: str) -> dict:
         return {"product_id": product_id, "name": p["name"], "in_stock": p["stock"] > 0, "quantity": p["stock"]}
     return {"error": f"Product {product_id} not found."}
 
+@mcp.tool()
 def check_order_status(order_id: str) -> dict:
     """Check the status of a customer order by order ID."""
     order = orders.get(order_id.upper())
     return {"status": "success", "order_id": order_id, **order} if order else {"status": "error", "message": f"Order {order_id} not found."}
 
+@mcp.tool()
 def process_return_request(order_id: str, reason: str) -> dict:
     """Process a return request for a given order."""
     order = orders.get(order_id.upper())
@@ -67,6 +74,7 @@ def process_return_request(order_id: str, reason: str) -> dict:
         return {"status": "success", "message": f"Return for {order_id} accepted. Reason: {reason}. Refund in 5-7 days."}
     return {"status": "error", "message": f"Order {order_id} not found."}
 
+@mcp.tool()
 def get_faq(topic: str) -> dict:
     """Answer FAQs about shipping, payment, returns, cancellations."""
     faqs = {
@@ -77,17 +85,31 @@ def get_faq(topic: str) -> dict:
     }
     return {"status": "success", "answer": faqs.get(topic.lower(), "Sorry, I don't have info on that topic.")}
 
-# ── AGENT SETUP ────────────────────────────────────────────────────────────
+mcp_app = mcp.http_app(transport="sse")
+
+def run_mcp_server():
+    uvicorn.run(mcp_app, host="0.0.0.0", port=8765, log_level="error")
+
+thread = threading.Thread(target=run_mcp_server, daemon=True)
+thread.start()
+
+app.mount("/mcp", mcp_app)
+
 session_service = InMemorySessionService()
 runner = None
 
 @app.on_event("startup")
 async def startup():
     global runner
+    await asyncio.sleep(2)
+
+    mcp_toolset = MCPToolset(
+        connection_params=SseConnectionParams(url="http://0.0.0.0:8765/sse")
+    )
 
     agent = Agent(
         name="ecommerce_support_agent",
-        model="gemini-2.0-flash",
+        model="gemini-flash-latest",
         description="AI customer support agent for an e-commerce store.",
         instruction="""
             You are a friendly customer support agent for an online store called ShopAI.
@@ -95,20 +117,12 @@ async def startup():
             Always be polite and concise.
             If you cannot help, say: 'Let me connect you to a human agent.'
         """,
-        tools=[
-            check_order_status,
-            process_return_request,
-            get_faq,
-            search_products,
-            get_product_details,
-            check_stock,
-        ],
+        tools=[mcp_toolset],
     )
 
     runner = Runner(agent=agent, app_name="ecommerce_agent", session_service=session_service)
     print("✅ Agent initialised and ready!")
 
-# ── MODELS ─────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
@@ -117,13 +131,10 @@ class ChatResponse(BaseModel):
     reply: str
     session_id: str
 
-# ── /chat ENDPOINT ─────────────────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """Send a message to the AI agent and receive a reply."""
     if runner is None:
         return ChatResponse(reply="Agent is still starting up. Please try again.", session_id=req.session_id)
-
     try:
         await session_service.create_session(
             app_name="ecommerce_agent",
@@ -132,25 +143,17 @@ async def chat(req: ChatRequest):
         )
     except Exception:
         pass
-
     content = types.Content(role="user", parts=[types.Part(text=req.message)])
     reply_text = "Sorry, I couldn't process that. Please try again."
-
     async for event in runner.run_async(user_id=req.session_id, session_id=req.session_id, new_message=content):
         if event.is_final_response() and event.content and event.content.parts:
             reply_text = event.content.parts[0].text
             break
-
     return ChatResponse(reply=reply_text, session_id=req.session_id)
 
-# ── ROOT ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def home():
-    return {
-        "status": "E-Commerce AI Agent is running!",
-        "chat_endpoint": "POST /chat",
-        "docs": "/docs"
-    }
+    return {"status": "E-Commerce AI Agent is running!", "chat_endpoint": "POST /chat", "docs": "/docs"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
