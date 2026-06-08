@@ -1,8 +1,6 @@
 google-adk
 fastapi
 uvicorn
- 
-
-
-
-
+fastmcp
+google-genai
+pydantic
